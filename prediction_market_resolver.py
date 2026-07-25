@@ -3,6 +3,11 @@
 from genlayer import *
 import json
 
+ERROR_EXPECTED = "[EXPECTED]"
+ERROR_EXTERNAL = "[EXTERNAL]"
+ERROR_TRANSIENT = "[TRANSIENT]"
+ERROR_LLM = "[LLM_ERROR]"
+
 
 class PredictionMarketResolver(gl.Contract):
     markets: TreeMap[str, str]
@@ -21,13 +26,18 @@ class PredictionMarketResolver(gl.Contract):
         question: str,
         resolution_criteria: str,
         closes_at: str,
+        evidence_url: str,
     ) -> None:
+        # evidence_url is committed at market creation time, not chosen later by
+        # whoever happens to trigger resolution, so it cannot be picked
+        # adversarially after the outcome is already known.
         market_id = str(int(self.market_count))
         self.markets[market_id] = json.dumps({
             "id": market_id,
             "question": question,
             "resolution_criteria": resolution_criteria,
             "closes_at": closes_at,
+            "evidence_url": evidence_url,
             "status": "OPEN",
             "yes_pool_cents": 0,
             "no_pool_cents": 0,
@@ -47,21 +57,21 @@ class PredictionMarketResolver(gl.Contract):
     ) -> None:
         market_raw = self.markets.get(market_id, None)
         if market_raw is None:
-            raise gl.vm.UserError("[EXPECTED] Market not found")
+            raise gl.vm.UserError(ERROR_EXPECTED + " Market not found")
         market = json.loads(market_raw)
         if market["status"] != "OPEN":
-            raise gl.vm.UserError("[EXPECTED] Market is not open for betting")
+            raise gl.vm.UserError(ERROR_EXPECTED + " Market is not open for betting")
 
         side = side.strip().upper()
         if side not in ("YES", "NO"):
-            raise gl.vm.UserError("[EXPECTED] Side must be YES or NO")
+            raise gl.vm.UserError(ERROR_EXPECTED + " Side must be YES or NO")
 
         try:
             amount_cents = int(round(float(amount_usd) * 100))
         except (ValueError, TypeError):
-            raise gl.vm.UserError("[EXPECTED] Invalid amount_usd")
+            raise gl.vm.UserError(ERROR_EXPECTED + " Invalid amount_usd")
         if amount_cents <= 0:
-            raise gl.vm.UserError("[EXPECTED] amount_usd must be positive")
+            raise gl.vm.UserError(ERROR_EXPECTED + " amount_usd must be positive")
 
         bet_id = str(int(self.bet_count))
         self.bets[bet_id] = json.dumps({
@@ -87,29 +97,45 @@ class PredictionMarketResolver(gl.Contract):
     def resolve_market(self, market_id: str, current_date: str) -> None:
         market_raw = self.markets.get(market_id, None)
         if market_raw is None:
-            raise gl.vm.UserError("[EXPECTED] Market not found")
+            raise gl.vm.UserError(ERROR_EXPECTED + " Market not found")
         market = json.loads(market_raw)
         if market["status"] != "OPEN":
-            raise gl.vm.UserError("[EXPECTED] Market already resolved")
+            raise gl.vm.UserError(ERROR_EXPECTED + " Market already resolved")
         if current_date < market["closes_at"]:
-            raise gl.vm.UserError("[EXPECTED] Market has not closed yet")
+            raise gl.vm.UserError(ERROR_EXPECTED + " Market has not closed yet")
 
         question = market["question"]
         resolution_criteria = market["resolution_criteria"]
+        evidence_url = market["evidence_url"]
 
         def resolve() -> str:
+            # Contract-side acquisition of authoritative, time-relevant evidence:
+            # every validator independently fetches the pre-committed source and
+            # resolves against its actual content, instead of relying on the
+            # model's own training-time knowledge of "real-world events."
+            resp = gl.nondet.web.get(evidence_url)
+            if resp.status >= 500:
+                raise gl.vm.UserError(ERROR_TRANSIENT + " Evidence source temporarily unavailable")
+            if resp.status >= 400:
+                raise gl.vm.UserError(ERROR_EXTERNAL + " Evidence source returned status " + str(resp.status))
+            evidence_content = resp.body.decode("utf-8", errors="replace")[:6000]
+
             task = (
-                "You are an impartial oracle resolving a prediction market based on real-world facts.\n\n"
+                "You are an impartial oracle resolving a prediction market. You must base your\n"
+                "decision on the FETCHED EVIDENCE below, not on your own general knowledge, since\n"
+                "the evidence reflects the actual state of the world as of resolution time.\n\n"
                 "QUESTION: " + question + "\n"
                 "RESOLUTION CRITERIA: " + resolution_criteria + "\n"
                 "MARKET CLOSE DATE: " + market["closes_at"] + "\n\n"
-                "Determine the outcome using your knowledge of real-world events up to and including the close date.\n"
+                "FETCHED EVIDENCE (from " + evidence_url + "):\n" + evidence_content + "\n\n"
+                "Determine the outcome strictly according to the resolution criteria and what the\n"
+                "fetched evidence actually shows.\n"
                 "Return ONLY a JSON object:\n"
-                "{\"outcome\": \"YES\", \"reasoning\": \"one sentence\"}\n\n"
+                "{\"outcome\": \"YES\", \"reasoning\": \"one sentence citing the evidence\"}\n\n"
                 "Rules:\n"
                 "- outcome must be exactly YES, NO, or UNRESOLVED\n"
-                "- UNRESOLVED only if the outcome genuinely cannot be determined from available facts\n"
-                "- reasoning: one sentence citing the basis for the decision\n"
+                "- UNRESOLVED only if the fetched evidence genuinely does not address the question\n"
+                "- reasoning: one sentence citing what the evidence showed\n"
                 "Return ONLY the JSON, no other text."
             )
             raw = gl.nondet.exec_prompt(task)
@@ -123,10 +149,16 @@ class PredictionMarketResolver(gl.Contract):
             end = raw.rfind("}") + 1
             if start >= 0 and end > start:
                 raw = raw[start:end]
-            parsed = json.loads(raw)
-            outcome = parsed.get("outcome", "UNRESOLVED")
+
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                raise gl.vm.UserError(ERROR_LLM + " Non-JSON response from model")
+
+            outcome = parsed.get("outcome", None)
             if outcome not in ("YES", "NO", "UNRESOLVED"):
-                outcome = "UNRESOLVED"
+                raise gl.vm.UserError(ERROR_LLM + " Invalid outcome: " + str(outcome))
+
             return json.dumps({
                 "outcome": outcome,
                 "reasoning": str(parsed.get("reasoning", "")),
